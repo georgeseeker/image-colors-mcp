@@ -22,8 +22,13 @@ Every decision here was measured rather than assumed. The ones worth knowing:
   edge -- those easily exceed the threshold. So a second test rejects any colour
   explainable as a linear blend of two more prevalent colours. Measured
   separation on the test diagram: AA colours <= 0.57, real colours >= 10.54.
-* **floodFill, not a whole-image mask.** Byte-identical answer at ~1/176th the
-  cost, and it scales with region size rather than image size.
+* **A pixel is a colour within `match_tol`, because a lossy file has no exact
+  values left.** Exact enumeration holds for anything a vector tool wrote, and
+  fails for anything that has been through JPEG, a resize or a re-encode: a
+  flat box then has no single value holding more than ~29% of it, so equality
+  fragments the region into thousands of one-pixel islands and the fill is
+  reported as a `hairline` of a few thousand pixels. Matching per channel
+  within 4 rebuilds the region, and is measurably free on a clean export.
 """
 
 from __future__ import annotations
@@ -40,12 +45,31 @@ import numpy as np
 from mcp.server.fastmcp import FastMCP
 from PIL import Image, ImageOps
 
-mcp = FastMCP("image-colors")
+INSTRUCTIONS = """\
+Report the colours an image uses, canvas excluded, plus enough geometry about
+each one to tie it back to an element.
 
-# Compare against the seed, not the neighbour. With cv2's default *floating*
-# range a smooth gradient drifts past the tolerance one step at a time and the
-# fill wanders across the whole ramp.
-_FLOODFILL = 4 | cv2.FLOODFILL_MASK_ONLY | cv2.FLOODFILL_FIXED_RANGE | (255 << 8)
+Reach for `image_colors` instead of looking at a screenshot: a model reading an
+image cannot tell #282c34 from #2b303b, and this answers with values that really
+exist in the file -- never averaged, quantised or clustered. `bbox` is
+[x, y, w, h] in image pixels, origin top-left.
+
+`count` is how many pixels are that colour within `match_tol` per channel;
+`exact_px` is how many match it exactly. On a clean export the two are equal.
+`count` far above `exact_px` means the image went through a lossy step (JPEG, a
+resize, a re-encode): the fills are still real and `hex` is still the region's
+mode, but `count` is the honest measure of the region and `exact_px` is not.
+The result carries a `note` saying so when that happens.
+
+The tail of `colors` can hold single-pixel rows left over from a lossy fill's
+grain; they are marked `hairline` and their counts are one or two orders of
+magnitude below the real fills. Lead with the first few entries.
+
+Photographs and pure gradients have no flat fills and will come back with an
+empty `colors` and an explanatory `note`.
+"""
+
+mcp = FastMCP("image-colors", instructions=INSTRUCTIONS)
 
 DEFAULTS = dict(
     min_count=16,        # candidate floor, in pixels
@@ -54,6 +78,8 @@ DEFAULTS = dict(
     max_examine=256,     # bound on how many candidates we are willing to test
     blend_tol=3.0,       # linear-mixture error below which a colour is AA
     near_tol=8.0,        # RGB distance within which a colour is a duplicate
+    match_tol=4,         # per-channel distance at which a pixel is that colour
+    max_walk=20000,      # bound on how many histogram bins we walk past
 )
 
 _BLEND_T_MIN, _BLEND_T_MAX = 0.05, 0.95   # a mixture, not an endpoint
@@ -133,6 +159,60 @@ def _pack(rgb: np.ndarray) -> np.ndarray:
             | rgb[..., 2].astype(np.uint32))
 
 
+def _channels(packed: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    return (packed >> 16) & 255, (packed >> 8) & 255, packed & 255
+
+
+def _within(packed: np.ndarray, key: int, tol: int,
+            ch: tuple | None = None) -> np.ndarray:
+    """Pixels that *are* this colour, allowing `tol` per channel.
+
+    Lossy storage does not leave a flat fill at one exact value. Measured on a
+    flat blue box, lossy variants differ in how far the noise reaches:
+
+        source                     mode share   +-1   +-2   +-4   +-8
+        clean vector export            95%      95%   95%   95%   95%
+        JPEG q55                       82%      83%   88%   90%   92%
+        downscaled to 40% and back     88%      89%   90%   91%   92%
+        screenshot re-encoded          29%      94%   97%   98%   99%
+
+    The last row is the awkward one: no single value holds more than 29% of a
+    flat box, so equality fragments it into thousands of one-pixel islands --
+    reported as a 7719-pixel "hairline" for a region that is really ~180000
+    pixels and unmistakably `filled`. `tol=4` puts 98% of it back into one
+    connected blob, and costs the clean export nothing at all, because a clean
+    export has no neighbours within 4 to absorb.
+
+    Per channel rather than Euclidean: it is the box the existing `near_tol=8`
+    duplicate test already encloses (4,4,4 is 6.93 apart), so this widens the
+    region test without widening what counts as a duplicate colour.
+
+    `ch` is the unpacked image, passed in because a candidate is described with
+    one of these and unpacking three times per candidate dominated the runtime
+    (7.6s against 0.46s on a 1800x1350 before this). Lookup tables rather than
+    abs-and-compare: three gathers and two ands beats six arithmetic passes plus
+    two temporaries.
+    """
+    if tol <= 0:
+        return packed == key
+    r, g, b = _channels(packed) if ch is None else ch
+    rk, gk, bk = (key >> 16) & 255, (key >> 8) & 255, key & 255
+    lr = np.zeros(256, bool)
+    lg = np.zeros(256, bool)
+    lb = np.zeros(256, bool)
+    lr[max(0, rk - tol):rk + tol + 1] = True
+    lg[max(0, gk - tol):gk + tol + 1] = True
+    lb[max(0, bk - tol):bk + tol + 1] = True
+    return lr[r] & lg[g] & lb[b]
+
+
+def _close(a: int, b: int, tol: int) -> bool:
+    """Scalar twin of `_within`, for deciding whether two colours are the same."""
+    return (abs(((a >> 16) & 255) - ((b >> 16) & 255)) <= tol
+            and abs(((a >> 8) & 255) - ((b >> 8) & 255)) <= tol
+            and abs((a & 255) - (b & 255)) <= tol)
+
+
 def _canvas(rgb: np.ndarray, alpha: np.ndarray | None) -> tuple[int | None, int]:
     """(canvas key, how many of the four corners agreed).
 
@@ -195,13 +275,30 @@ def _shape(fill: float, thickness: float | None) -> str:
     return "stroke"
 
 
-def _describe(packed: np.ndarray, key: int, count: int, min_blob: int) -> dict | None:
+def _describe(packed: np.ndarray, key: int, exact: int, min_blob: int,
+              match_tol: int, ch: tuple | None = None) -> dict | None:
     """Geometry for one colour, or None when it forms nothing but fragments.
 
     Labelling runs on the colour's own bounding box, not the whole image: a
     colour confined to a corner costs its own area rather than the image's.
+
+    The mask is `match_tol`-tolerant, so `count` is the size of the region the
+    colour occupies rather than how often one exact value appears. `exact_px`
+    is that narrower number: the two together say how lossy the image is, and
+    they are equal on anything that came straight out of a vector tool.
+
+    Tolerance chains along a noise ridge. JPEG leaves thin rows at block
+    boundaries whose every pixel holds a different value, each too rare to be a
+    candidate on its own; inside a tolerance they become one long sliver and
+    pass `min_blob`. So a blob no wider than the tolerance in either direction
+    is dropped *when it is mostly not the colour it is named for* -- it is
+    something the tolerance assembled rather than something that is there. The
+    share test is what keeps a genuine hairline: a 2px rule that really is one
+    value scores 1.0 and survives, and on a clean export every blob scores 1.0,
+    so nothing is dropped at all.
     """
-    mask = packed == key
+    mask = _within(packed, key, match_tol, ch)
+    count = int(mask.sum())
     rows = np.flatnonzero(mask.any(axis=1))
     if rows.size == 0:
         return None
@@ -213,6 +310,12 @@ def _describe(packed: np.ndarray, key: int, count: int, min_blob: int) -> dict |
     _, labels, stats, _ = cv2.connectedComponentsWithStats(sub, connectivity=8)
     areas = stats[1:, 4]
     keep = areas >= min_blob
+    if match_tol > 0 and keep.any():
+        here = (packed[y0:y1, x0:x1] == key)
+        per_blob = np.bincount(labels[here], minlength=stats.shape[0])[1:]
+        thin = (stats[1:, 2] <= match_tol) | (stats[1:, 3] <= match_tol)
+        assembled = per_blob / np.maximum(areas, 1) < 0.5
+        keep &= ~(thin & assembled)
     if not keep.any():
         return None
 
@@ -232,6 +335,7 @@ def _describe(packed: np.ndarray, key: int, count: int, min_blob: int) -> dict |
         "rgb": list(rgb),
         "hsl": _hsl(rgb),
         "count": count,
+        "exact_px": exact,
         "blobs": int(len(blobs)),
         "sizes": [int(v) for v in areas[:8]],
         "largest": {"bbox": [x, y, bw, bh], "area": area,
@@ -292,10 +396,12 @@ def _drop_blends(entries: list[dict], canvas: tuple | None,
 
 
 def _analyze(path: str, min_count: int, min_blob: int, max_candidates: int,
-             max_examine: int, blend_tol: float, near_tol: float) -> dict:
+             max_examine: int, blend_tol: float, near_tol: float,
+             match_tol: int, max_walk: int) -> dict:
     rgb, alpha = _load(path)
     h, w = rgb.shape[:2]
     packed = _pack(rgb)
+    ch = _channels(packed) if match_tol > 0 else None
 
     visible = packed.ravel() if alpha is None else packed[alpha]
     canvas_key, agree = _canvas(rgb, alpha)
@@ -304,8 +410,14 @@ def _analyze(path: str, min_count: int, min_blob: int, max_candidates: int,
 
     excluded = 0
     if canvas_key is not None:
-        excluded = int((visible == canvas_key).sum())
-        visible = visible[visible != canvas_key]
+        # Tolerant too, and that matters on a lossy image: the corners sample
+        # one value out of the noise (#fdfdfe) while the modal background value
+        # is another (#fefefe, 358020 px). Excluding the corner value alone
+        # would leave the whole background in the pool, where it comes back as
+        # the dominant "colour" of a diagram that has no such element.
+        on_canvas = _within(visible, canvas_key, match_tol)
+        excluded = int(on_canvas.sum())
+        visible = visible[~on_canvas]
 
     uniq, cnt = np.unique(visible, return_counts=True)
     order = np.argsort(-cnt)
@@ -316,20 +428,36 @@ def _analyze(path: str, min_count: int, min_blob: int, max_candidates: int,
     # Walk by descending frequency and keep the first max_candidates that pass
     # geometry -- not the top max_candidates, then filter. Frequency order is
     # what makes the staleness cut below safe.
+    #
+    # A colour within match_tol of one already accepted is the same region seen
+    # through a different noise value, so it is skipped rather than described.
+    # Without that, a lossy image loses its palette twice over: every one of
+    # the ~110 near-neighbours of the first colour burns an examine slot, and
+    # the survivors come back as duplicates with counts too close for the
+    # `mine < c` tie-break in _drop_near_duplicates to resolve. Suppressed
+    # candidates cost neither an examine slot nor a geometry pass.
     entries: list[dict] = []
-    examined = stale = 0
+    accepted: list[int] = []
+    examined = stale = walked = 0
     for i in order:
         if len(entries) >= max_candidates or examined >= max_examine:
             break
         if stale >= max_candidates:
             break          # a whole palette's worth of misses in a row; the
                            # remaining colours are rarer and overwhelmingly AA
+        if walked >= max_walk:
+            break
+        walked += 1
+        key = int(uniq[i])
+        if any(_close(key, a, match_tol) for a in accepted):
+            continue
         examined += 1
-        described = _describe(packed, int(uniq[i]), int(cnt[i]), min_blob)
+        described = _describe(packed, key, int(cnt[i]), min_blob, match_tol, ch)
         if described is None:
             stale += 1
         else:
             entries.append(described)
+            accepted.append(key)
             stale = 0
 
     canvas_pool = None if canvas_rgb is None else (canvas_rgb, excluded)
@@ -349,21 +477,37 @@ def _analyze(path: str, min_count: int, min_blob: int, max_candidates: int,
         "colors": entries,
         "dropped_aa": {"count": len(dropped), "hexes": dropped[:8]},
         "examined_candidates": examined,
+        "match_tol": match_tol,
     }
     if not entries:
         result["note"] = (
             "no colour formed a blob large enough to count as a flat fill; this "
-            "is normal for photographs, gradients and heavy JPEG artefacts, "
-            "where the exact-enumeration premise does not hold")
+            "is normal for photographs and gradients, where the single-fill "
+            "premise does not hold")
+    else:
+        # A dithered fill keeps its pixels but spreads them over thousands of
+        # values, so the biggest region's exact share is the cheapest honest
+        # reading of how lossy the image is. Clean exports sit at 1.0.
+        lead = max(entries, key=lambda e: e["count"])
+        share = lead["exact_px"] / float(lead["count"])
+        if share < 0.6:
+            result["note"] = (
+                "this image has been through a lossy step (JPEG, a resize, or a "
+                "re-encode): its flat fills are dithered, so no single value "
+                "holds a region. `hex` values are still exact and are still the "
+                "region's mode, but `count` is tolerance-matched and `exact_px` "
+                "is the old exact number -- compare the two to see how lossy "
+                "the largest region is (%.2f exact)." % share)
     return result
 
 
 @lru_cache(maxsize=32)
 def _cached(path: str, mtime_ns: int, min_count: int, min_blob: int,
             max_candidates: int, max_examine: int, blend_tol: float,
-            near_tol: float) -> str:
+            near_tol: float, match_tol: int, max_walk: int) -> str:
     return json.dumps(_analyze(path, min_count, min_blob, max_candidates,
-                               max_examine, blend_tol, near_tol))
+                               max_examine, blend_tol, near_tol, match_tol,
+                               max_walk))
 
 
 def _resolve(path: str) -> tuple[str, int]:
@@ -377,16 +521,19 @@ def _resolve(path: str) -> tuple[str, int]:
 # tools
 # --------------------------------------------------------------------------
 
-def _colors(path: str, min_blob_px: int, max_candidates: int) -> dict:
+def _colors(path: str, min_blob_px: int, max_candidates: int,
+            match_tol: int) -> dict:
     resolved, mtime = _resolve(path)
     return json.loads(_cached(resolved, mtime, DEFAULTS["min_count"], min_blob_px,
                               max_candidates, DEFAULTS["max_examine"],
-                              DEFAULTS["blend_tol"], DEFAULTS["near_tol"]))
+                              DEFAULTS["blend_tol"], DEFAULTS["near_tol"],
+                              match_tol, DEFAULTS["max_walk"]))
 
 
 @mcp.tool()
 def image_colors(path: str, min_blob_px: int = DEFAULTS["min_blob_px"],
-                 max_candidates: int = DEFAULTS["max_candidates"]) -> dict:
+                 max_candidates: int = DEFAULTS["max_candidates"],
+                 match_tol: int = DEFAULTS["match_tol"]) -> dict:
     """List the colours an image uses, canvas excluded.
 
     Each colour comes with the geometry of the regions it forms: how many
@@ -395,70 +542,20 @@ def image_colors(path: str, min_blob_px: int = DEFAULTS["min_blob_px"],
     column is a row of identical shapes; `fill` near 0.785 is a circle (pi/4);
     a low `fill` with high `solidity` means a rotated or irregular solid.
 
-    Colours are exact: every distinct 24-bit value is enumerated, nothing is
-    averaged or clustered. Anti-aliasing is rejected by geometry plus a
-    linear-mixture test, so `colors` should be the design palette. `count` is
-    reported per colour but coverage ratios are deliberately not.
+    `hex` is always an exact value that exists in the image -- nothing is
+    averaged or clustered. `count` is how many pixels are that colour within
+    `match_tol` per channel, and `exact_px` is how many match it exactly.
+    `count > exact_px` means the fill has been dithered by a lossy step; the
+    region is real and `hex` is its mode, but the image is not a clean export.
+    On a clean export the two are equal.
+
+    Anti-aliasing is rejected by geometry plus a linear-mixture test, so
+    `colors` should be the design palette. Coverage ratios are deliberately
+    not reported.
 
     bbox is [x, y, width, height] in image pixels, origin top-left.
     """
-    return _colors(path, min_blob_px, max_candidates)
-
-
-@mcp.tool()
-def image_pixel(path: str, x: int, y: int, tolerance: int = 10) -> dict:
-    """Colour at one pixel, snapped to the flat region containing it.
-
-    x/y are image pixels, origin top-left. A rough aim is fine: the point is a
-    *seed*, and the flat region it falls in is grown from there, so the answer
-    is the element's fill colour rather than whatever that one pixel was.
-
-    `hex` is the mode of the region -- the most common exact value, guaranteed
-    to exist in the image -- not an average. `dominant_share` says how much of
-    the region it covers; `flat` is that share >= 0.95. When `flat` is false
-    the seed landed on a gradient or an edge and the answer should not be
-    treated as a single design colour.
-
-    `tolerance` is per-channel and measured against the seed (FIXED_RANGE), so
-    a gradient cannot drift the fill away. It is deliberately tight: 18 would
-    merge #121212 with #1C1C1C, which are distinct surfaces in dark UI.
-    """
-    rgb, alpha = _load(path)
-    h, w = rgb.shape[:2]
-    if not (0 <= x < w and 0 <= y < h):
-        raise ValueError(f"({x}, {y}) is outside the image, which is {w}x{h}")
-    if alpha is not None and not alpha[y, x]:
-        return {"seed": [x, y], "error": "seed is a transparent pixel",
-                "hex": None}
-
-    mask = np.zeros((h + 2, w + 2), np.uint8)
-    cv2.floodFill(rgb, mask, (x, y), 0, (tolerance,) * 3, (tolerance,) * 3, _FLOODFILL)
-    sel = mask[1:-1, 1:-1].astype(bool)
-    if not sel.any():
-        return {"seed": [x, y], "error": "seed rejected"}
-
-    packed = _pack(rgb[sel])
-    uniq, cnt = np.unique(packed, return_counts=True)
-    top = int(np.argmax(cnt))
-    key, hits = int(uniq[top]), int(cnt[top])
-    rgb_mode = ((key >> 16) & 255, (key >> 8) & 255, key & 255)
-    share = hits / float(packed.size)
-    ys, xs = np.nonzero(sel)
-
-    return {
-        "seed": [x, y],
-        "hex": _hex(rgb_mode),
-        "rgb": list(rgb_mode),
-        "hsl": _hsl(rgb_mode),
-        "region": {
-            "area_px": int(packed.size),
-            "bbox": [int(xs.min()), int(ys.min()),
-                     int(xs.max() - xs.min() + 1), int(ys.max() - ys.min() + 1)],
-            "distinct": int(uniq.size),
-        },
-        "dominant_share": round(share, 4),
-        "flat": bool(share >= 0.95),
-    }
+    return _colors(path, min_blob_px, max_candidates, match_tol)
 
 
 if __name__ == "__main__":
